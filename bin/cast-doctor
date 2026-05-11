@@ -1,0 +1,393 @@
+#!/usr/bin/env bash
+# cast-doctor — health check for any Claude Code install
+#
+# Validates hooks, MCP server config, agent definitions, cast.db schema integrity,
+# and stale auto-memory entries. Works without the full CAST framework.
+#
+# Usage:
+#   cast-doctor              # run all checks
+#   cast-doctor --json       # machine-readable output
+#   cast-doctor --quick      # skip the slower checks (memory walk, db read)
+#   cast-doctor --strict     # exit non-zero on any warning
+#   cast-doctor version      # print version
+#   cast-doctor help         # this message
+
+set -euo pipefail
+
+if [[ "${CLAUDE_SUBPROCESS:-}" == "1" ]]; then
+  exit 0
+fi
+
+# ── Resolve paths ────────────────────────────────────────────────────────────
+SCRIPT_REAL="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_REAL")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+VERSION_FILE="$REPO_DIR/VERSION"
+CD_VERSION="$(cat "$VERSION_FILE" 2>/dev/null || echo unknown)"
+
+CAST_DB_PATH="${CAST_DB_PATH:-$HOME/.claude/cast.db}"
+CAST_AGENTS_DIR="${CAST_AGENTS_DIR:-$HOME/.claude/agents}"
+SETTINGS_FILE="${CAST_SETTINGS_FILE:-$HOME/.claude/settings.json}"
+EVENTS_DIR="${CAST_EVENTS_DIR:-$HOME/.claude/cast/events}"
+PROJECTS_DIR="${CAST_PROJECTS_DIR:-$HOME/.claude/projects}"
+
+# ── Output helpers ───────────────────────────────────────────────────────────
+if [ -t 1 ] && [ "${TERM:-}" != "dumb" ]; then
+  C_BOLD='\033[1m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'
+  C_RED='\033[0;31m'; C_CYAN='\033[0;36m'; C_RESET='\033[0m'
+else
+  C_BOLD='' C_GREEN='' C_YELLOW='' C_RED='' C_CYAN='' C_RESET=''
+fi
+
+OK="[${C_GREEN}ok${C_RESET}]"
+WARN="[${C_YELLOW}!!${C_RESET}]"
+ERR="[${C_RED}ERR${C_RESET}]"
+INFO="[${C_CYAN}--${C_RESET}]"
+
+# ── Flags ────────────────────────────────────────────────────────────────────
+JSON_OUTPUT=0
+QUICK=0
+STRICT=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json)         JSON_OUTPUT=1; shift ;;
+    --quick)        QUICK=1; shift ;;
+    --strict)       STRICT=1; shift ;;
+    version|-v|--version) echo "cast-doctor v$CD_VERSION"; exit 0 ;;
+    help|-h|--help)
+      sed -n 's/^# \{0,1\}//;3,9p' "${BASH_SOURCE[0]}"
+      exit 0 ;;
+    *) echo "Unknown argument: $1" >&2; exit 1 ;;
+  esac
+done
+
+# ── State accumulators ───────────────────────────────────────────────────────
+OVERALL=0           # 0 = healthy
+WARN_COUNT=0
+ERR_COUNT=0
+RESULTS=()          # for --json output: "label|status|detail"
+
+_record() {
+  local status="$1" label="$2" detail="$3"
+  RESULTS+=("$label|$status|$detail")
+  case "$status" in
+    err)
+      ERR_COUNT=$((ERR_COUNT + 1))
+      OVERALL=1
+      ;;
+    warn)
+      WARN_COUNT=$((WARN_COUNT + 1))
+      if [ "$STRICT" -eq 1 ]; then
+        OVERALL=1
+      fi
+      ;;
+  esac
+}
+
+_say_ok()   { _record ok   "$1" "$2"; [ "$JSON_OUTPUT" -eq 1 ] || printf "%b %s\n" "$OK"   "$2"; }
+_say_warn() { _record warn "$1" "$2"; [ "$JSON_OUTPUT" -eq 1 ] || printf "%b %s\n" "$WARN" "$2"; }
+_say_err()  { _record err  "$1" "$2"; [ "$JSON_OUTPUT" -eq 1 ] || printf "%b %s\n" "$ERR"  "$2"; }
+_say_info() { _record info "$1" "$2"; [ "$JSON_OUTPUT" -eq 1 ] || printf "%b %s\n" "$INFO" "$2"; }
+
+# ── Header ───────────────────────────────────────────────────────────────────
+if [ "$JSON_OUTPUT" -eq 0 ]; then
+  printf "${C_BOLD}cast-doctor v%s${C_RESET}\n" "$CD_VERSION"
+  printf "%s\n" "$(python3 -c "print('─' * 52)" 2>/dev/null || printf '%0.s-' {1..52})"
+fi
+
+# ── 1. cast.db accessible ────────────────────────────────────────────────────
+if [ "$QUICK" -eq 0 ]; then
+  if command -v sqlite3 >/dev/null && sqlite3 "$CAST_DB_PATH" 'SELECT 1' >/dev/null 2>&1; then
+    _say_ok "cast_db" "cast.db accessible ($CAST_DB_PATH)"
+  elif [ ! -f "$CAST_DB_PATH" ]; then
+    _say_info "cast_db" "cast.db not present ($CAST_DB_PATH) — skipping schema check"
+  else
+    _say_err "cast_db" "cast.db not accessible ($CAST_DB_PATH)"
+  fi
+
+  # 2. Core schema tables — only if db is readable
+  if command -v sqlite3 >/dev/null && [ -f "$CAST_DB_PATH" ]; then
+    required="sessions agent_runs agent_memories routing_events"
+    missing=""
+    found=0
+    for tbl in $required; do
+      if sqlite3 "$CAST_DB_PATH" "SELECT name FROM sqlite_master WHERE type='table' AND name='$tbl';" 2>/dev/null | grep -q "$tbl"; then
+        found=$((found + 1))
+      else
+        missing="$missing $tbl"
+      fi
+    done
+    if [ -z "$missing" ]; then
+      _say_ok "schema" "Schema: $found / 4 core tables present"
+    else
+      _say_warn "schema" "Schema: $found / 4 core tables — missing:$missing"
+    fi
+  fi
+fi
+
+# ── 3. Hook count in settings.json ───────────────────────────────────────────
+hook_count=0
+if [ -f "$SETTINGS_FILE" ]; then
+  hook_count="$(python3 - "$SETTINGS_FILE" <<'PYEOF' 2>/dev/null || echo 0
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f)
+    hooks = cfg.get("hooks", {})
+    total = sum(len(v) if isinstance(v, list) else 1 for v in hooks.values())
+    print(total)
+except Exception:
+    print(0)
+PYEOF
+)"
+  if [ "${hook_count:-0}" -gt 0 ]; then
+    _say_ok "hook_count" "Hooks registered: $hook_count entries in settings.json"
+  else
+    _say_warn "hook_count" "Hooks registered: 0 — no hooks found in settings.json"
+  fi
+else
+  _say_info "hook_count" "settings.json not present ($SETTINGS_FILE)"
+fi
+
+# ── 4. Hook script existence ─────────────────────────────────────────────────
+if [ -f "$SETTINGS_FILE" ]; then
+  missing_scripts="$(python3 - "$SETTINGS_FILE" <<'PYEOF' 2>/dev/null || echo ""
+import json, os, sys
+try:
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f)
+    hooks = cfg.get("hooks", {})
+except Exception:
+    sys.exit(0)
+interpreters = {"bash", "sh", "python3", "python", "node"}
+missing = []
+for event, entries in hooks.items():
+    if not isinstance(entries, list):
+        entries = [entries]
+    for entry in entries:
+        inner = entry.get("hooks", []) if isinstance(entry, dict) else []
+        for h in inner:
+            if not isinstance(h, dict):
+                continue
+            cmd = h.get("command", "")
+            if not cmd:
+                continue
+            for part in cmd.split():
+                if part in interpreters or part.startswith("-"):
+                    continue
+                expanded = os.path.expanduser(part)
+                if "/" in expanded and not os.path.isfile(expanded):
+                    missing.append(expanded)
+                break
+for m in missing:
+    print(m)
+PYEOF
+)"
+  if [ -z "$missing_scripts" ]; then
+    _say_ok "hook_scripts" "Hook scripts: all referenced paths exist"
+  else
+    while IFS= read -r p; do
+      [ -z "$p" ] && continue
+      _say_err "hook_scripts" "Hook script missing: $p"
+    done <<< "$missing_scripts"
+  fi
+fi
+
+# ── 5. Events dir ────────────────────────────────────────────────────────────
+if [ -d "$EVENTS_DIR" ] && [ -w "$EVENTS_DIR" ]; then
+  _say_ok "events_dir" "Events dir writable ($EVENTS_DIR)"
+elif [ -d "$EVENTS_DIR" ]; then
+  _say_warn "events_dir" "Events dir present but not writable ($EVENTS_DIR)"
+elif [ "$QUICK" -eq 0 ]; then
+  _say_info "events_dir" "Events dir not present ($EVENTS_DIR)"
+fi
+
+# ── 6. Agent count ───────────────────────────────────────────────────────────
+agent_count=0
+if [ -d "$CAST_AGENTS_DIR" ]; then
+  # `find` is glob-failure-safe; `ls *.md` under set -o pipefail dies when the
+  # glob matches nothing (ls returns 1, killing the pipeline).
+  agent_count="$(find "$CAST_AGENTS_DIR" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
+fi
+if [ "${agent_count:-0}" -gt 0 ]; then
+  _say_info "agents" "Agents: $agent_count installed in $CAST_AGENTS_DIR"
+else
+  _say_info "agents" "Agents: none found in $CAST_AGENTS_DIR"
+fi
+
+# ── 7. Agent frontmatter parses ──────────────────────────────────────────────
+if [ "$QUICK" -eq 0 ] && [ -d "$CAST_AGENTS_DIR" ]; then
+  bad_count=0
+  bad_list=""
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    if ! head -50 "$f" | python3 -c "
+import sys
+text = sys.stdin.read()
+if not text.startswith('---'):
+    sys.exit(1)
+end = text.find('---', 4)
+if end < 0:
+    sys.exit(1)
+front = text[4:end]
+required = ['name', 'description']
+for k in required:
+    if k+':' not in front:
+        sys.exit(1)
+" 2>/dev/null; then
+      bad_count=$((bad_count + 1))
+      bad_list="$bad_list $(basename "$f")"
+    fi
+  done < <(find "$CAST_AGENTS_DIR" -maxdepth 2 -name '*.md' 2>/dev/null)
+  if [ "$bad_count" -eq 0 ]; then
+    [ "${agent_count:-0}" -gt 0 ] && _say_ok "agent_frontmatter" "Agent frontmatter: all parse (name, description required)"
+  else
+    _say_warn "agent_frontmatter" "Agent frontmatter: $bad_count file(s) failed parse:$bad_list"
+  fi
+fi
+
+# ── 8. BATS available ────────────────────────────────────────────────────────
+if command -v bats >/dev/null 2>&1; then
+  bats_version="$(bats --version 2>/dev/null | head -1)"
+  _say_ok "bats" "BATS available ($bats_version)"
+else
+  _say_warn "bats" "BATS not found (install: brew install bats-core)"
+fi
+
+# ── 9. MCP servers in settings ───────────────────────────────────────────────
+if [ -f "$SETTINGS_FILE" ]; then
+  mcp_count="$(python3 - "$SETTINGS_FILE" <<'PYEOF' 2>/dev/null || echo 0
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f)
+    servers = cfg.get("mcpServers", {})
+    print(len(servers))
+except Exception:
+    print(0)
+PYEOF
+)"
+  if [ "${mcp_count:-0}" -gt 0 ]; then
+    _say_ok "mcp" "MCP servers: $mcp_count configured"
+  else
+    _say_info "mcp" "MCP servers: none configured"
+  fi
+fi
+
+# ── 10. Stale auto-memory entries ────────────────────────────────────────────
+if [ "$QUICK" -eq 0 ] && [ -d "$PROJECTS_DIR" ]; then
+  stale_count="$(python3 - <<PYEOF 2>/dev/null || echo 0
+import os, re
+from datetime import datetime
+projects_dir = "$PROJECTS_DIR"
+stale = []
+try:
+    for proj in os.listdir(projects_dir):
+        mdir = os.path.join(projects_dir, proj, "memory")
+        if not os.path.isdir(mdir):
+            continue
+        for fname in os.listdir(mdir):
+            if fname == "MEMORY.md" or not fname.endswith(".md"):
+                continue
+            fpath = os.path.join(mdir, fname)
+            try:
+                with open(fpath) as f:
+                    content = f.read()
+            except Exception:
+                continue
+            if not content.startswith('---'):
+                continue
+            parts = content.split('---')
+            if len(parts) < 3:
+                continue
+            frontmatter, body = parts[1], '---'.join(parts[2:])
+            verified_at = None
+            for line in frontmatter.split('\n'):
+                if line.startswith('verified_at:'):
+                    m = re.search(r'(\d{4}-\d{2}-\d{2})', line)
+                    if m:
+                        verified_at = m.group(1)
+                    break
+            if not verified_at:
+                continue
+            try:
+                vdate = datetime.strptime(verified_at, '%Y-%m-%d')
+                age = (datetime.utcnow() - vdate).days
+            except Exception:
+                continue
+            if age <= 30:
+                continue
+            has_specific = bool(
+                re.search(r'/scripts/', body) or
+                re.search(r'~/.claude/', body) or
+                re.search(r'\w+\(\)', body) or
+                re.search(r'--\w+', body)
+            )
+            if has_specific:
+                stale.append(fpath)
+except Exception:
+    pass
+print(len(stale))
+PYEOF
+)"
+  if [ "${stale_count:-0}" -eq 0 ]; then
+    _say_ok "stale_memory" "Stale auto-memories: none (verified_at within 30 days)"
+  else
+    _say_warn "stale_memory" "Stale auto-memories: $stale_count flagged (>30 days, name specific paths/flags)"
+  fi
+
+  # 11. Pending memory review queue
+  pending_count="$(python3 - <<PYEOF 2>/dev/null || echo 0
+import os
+projects_dir = "$PROJECTS_DIR"
+count = 0
+try:
+    for proj in os.listdir(projects_dir):
+        pdir = os.path.join(projects_dir, proj, "memory", "_pending")
+        if os.path.isdir(pdir):
+            for f in os.listdir(pdir):
+                if f.endswith(".md") and f != "MEMORY.md":
+                    count += 1
+except Exception:
+    pass
+print(count)
+PYEOF
+)"
+  if [ "${pending_count:-0}" -eq 0 ]; then
+    _say_ok "memory_queue" "Pending memory review: queue empty"
+  else
+    _say_warn "memory_queue" "Pending memory review: $pending_count entries"
+  fi
+fi
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+if [ "$JSON_OUTPUT" -eq 1 ]; then
+  python3 - <<PYEOF
+import json, sys
+results = []
+raw = """$(printf '%s\n' "${RESULTS[@]}")"""
+for line in raw.strip().split("\n"):
+    if not line.strip():
+        continue
+    parts = line.split("|", 2)
+    if len(parts) == 3:
+        results.append({"label": parts[0], "status": parts[1], "detail": parts[2]})
+print(json.dumps({
+    "version": "$CD_VERSION",
+    "overall": "healthy" if $OVERALL == 0 else "degraded",
+    "warnings": $WARN_COUNT,
+    "errors": $ERR_COUNT,
+    "checks": results,
+}, indent=2))
+PYEOF
+else
+  printf "%s\n" "$(python3 -c "print('─' * 52)" 2>/dev/null || printf '%0.s-' {1..52})"
+  if [ "$OVERALL" -eq 0 ]; then
+    printf "${C_GREEN}Overall: healthy${C_RESET}  (warnings: %d)\n" "$WARN_COUNT"
+  else
+    printf "${C_RED}Overall: degraded${C_RESET}  (errors: %d, warnings: %d)\n" "$ERR_COUNT" "$WARN_COUNT"
+  fi
+fi
+
+exit "$OVERALL"
