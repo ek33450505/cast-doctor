@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.1] — 2026-06-05
+
+### Fixed
+- README sample output: agent count `22` -> `23` (reflects current CAST v7.4)
+- README ecosystem block: cast-hooks script count `13` -> `16`
+- README ecosystem block: removed fictional "Constellation 3D graph" claim from cast-desktop description
+- README sync-note: replaced hardcoded `~/Projects/personal/` path with generic instruction
+
 ## [0.1.0] — 2026-05-12
 
 Initial release. Extracted from [claude-agent-team](https://github.com/ek33450505/claude-agent-team) v7.0's `cast doctor` subcommand.
