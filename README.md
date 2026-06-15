@@ -33,7 +33,7 @@ cast-doctor version      # print version
 Sample output:
 
 ```
-cast-doctor v0.1.0
+cast-doctor v0.1.2
 ────────────────────────────────────────────────────
 [ok] cast.db accessible (/Users/you/.claude/cast.db)
 [ok] Schema: 4 / 4 core tables present
@@ -84,7 +84,7 @@ Every path is overridable via environment variables — useful in CI, testing, o
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "0.1.2",
   "overall": "healthy",
   "warnings": 0,
   "errors": 0,

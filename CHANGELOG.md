@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.2] — 2026-06-15
+
+### Updated
+- VERSION: bumped for v8 sync
+- README sample output: updated version string from v0.1.0 to v0.1.2
+
 ## [0.1.1] — 2026-06-05
 
 ### Fixed
