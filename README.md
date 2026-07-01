@@ -33,7 +33,7 @@ cast-doctor version      # print version
 Sample output:
 
 ```
-cast-doctor v0.1.2
+cast-doctor v0.1.3
 ────────────────────────────────────────────────────
 [ok] cast.db accessible (/Users/you/.claude/cast.db)
 [ok] Schema: 4 / 4 core tables present
@@ -66,6 +66,8 @@ Overall: healthy  (warnings: 0)
 | 10 | Stale auto-memory entries | Any `verified_at` > 30 days AND body names specific paths/flags |
 | 11 | Pending memory review queue | Any `_pending/*.md` files awaiting promotion |
 
+> **v9 note:** The core-schema check validates the 4 always-present core tables — a deliberate standalone subset. The full CAST v9 `cast.db` canonical schema is 38 tables; run `cast doctor` from [claude-agent-team](https://github.com/ek33450505/claude-agent-team) for the complete table-aware check.
+
 ## Configuration
 
 Every path is overridable via environment variables — useful in CI, testing, or non-standard installs:
@@ -84,7 +86,7 @@ Every path is overridable via environment variables — useful in CI, testing, o
 
 ```json
 {
-  "version": "0.1.2",
+  "version": "0.1.3",
   "overall": "healthy",
   "warnings": 0,
   "errors": 0,
