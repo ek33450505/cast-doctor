@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3] — 2026-07-01
+
+### Updated
+- VERSION: bumped to 0.1.3 for v9 ecosystem sync
+- README sample output + JSON example: version string `0.1.2` → `0.1.3`
+- README: added v9 schema-awareness note — the core-4 schema check is a deliberate standalone subset of the v9 38-table canonical `cast.db` schema (full check via `cast doctor` in claude-agent-team)
+
 ## [0.1.2] — 2026-06-15
 
 ### Updated
